@@ -153,7 +153,14 @@ Note: Slack UI may still ask for a Request URL while creating slash commands; So
 
 ## 10. Create systemd service
 
-Create `/etc/systemd/system/vps-agent.service`:
+Copy the versioned template:
+
+```bash
+cd /opt/vps-agent
+sudo cp deploy/systemd/vps-agent.service /etc/systemd/system/vps-agent.service
+```
+
+Template content:
 
 ```ini
 [Unit]
@@ -166,7 +173,9 @@ Type=simple
 User=root
 WorkingDirectory=/opt/vps-agent
 EnvironmentFile=/opt/vps-agent/config/secrets.env
-ExecStart=/root/.bun/bin/bun run start
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.bun/bin
+ExecStartPre=/usr/bin/test -x /root/.bun/bin/bun
+ExecStart=/root/.bun/bin/bun run src/index.ts
 Restart=always
 RestartSec=5
 
@@ -174,11 +183,14 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-If Bun binary is elsewhere, replace `ExecStart` accordingly (`which bun`).
+If Bun binary is elsewhere, update `ExecStartPre`, `ExecStart`, and the extra `PATH` entry accordingly.
 
 Reload and start:
 
 ```bash
+which bun
+ls -l /root/.bun/bin/bun
+sudo systemd-analyze verify /etc/systemd/system/vps-agent.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now vps-agent
 sudo systemctl status vps-agent --no-pager
@@ -215,6 +227,7 @@ From Slack:
 Agent will:
 
 1. Clone/pull repo
+   - For `https://github.com/...` URLs, the agent injects `GITHUB_TOKEN` into Git remote auth automatically to avoid credential prompts.
 2. Detect stack
 3. Build/run Docker or Compose
 4. Health check
@@ -288,6 +301,7 @@ sudo journalctl -u vps-agent -n 100 --no-pager
 ## 17. Troubleshooting checklist
 
 - Missing token errors: verify `config/secrets.env` keys and service `EnvironmentFile`
+- `status=203/EXEC`: Bun path or execute permissions are wrong. Re-check `ExecStartPre`, `ExecStart`, `which bun`, and `ls -l` output for the bun binary.
 - Slash commands not responding: check app scopes + reinstall app
 - Mention events missing: verify `app_mention` subscription
 - Domain not routing: verify DNS wildcard and Caddy `import /etc/caddy/conf.d/*.caddy`

@@ -1,4 +1,5 @@
 import { createOpencode, type OpencodeClient } from "@opencode-ai/sdk";
+import type { AuditService } from "./audit";
 import type { Logger } from "./logger";
 import type { AppConfig } from "./types";
 
@@ -29,9 +30,23 @@ export class OpencodeReasoner {
   private sessionId: string | null = null;
   private closeServer: (() => void) | null = null;
 
-  constructor(private readonly config: AppConfig, private readonly logger: Logger) {}
+  constructor(
+    private readonly config: AppConfig,
+    private readonly logger: Logger,
+    private readonly audit: AuditService
+  ) {}
 
   async ask(question: string, systemPrompt?: string): Promise<string> {
+    const eventId = this.audit.createEventId();
+    this.audit.record({
+      eventId,
+      component: "llm",
+      action: "prompt_started",
+      status: "started",
+      requestSource: "system",
+      requestText: question,
+      meta: { model: this.config.opencode.modelPrimary },
+    });
     await this.ensureReady();
 
     if (!this.client || !this.sessionId) {
@@ -58,14 +73,48 @@ export class OpencodeReasoner {
       if ("data" in response && response.data) {
         const text = collectText(response.data.parts as Array<{ type?: string; text?: string }>);
         if (text) {
+          this.audit.record({
+            eventId,
+            component: "llm",
+            action: "prompt_completed",
+            status: "completed",
+            requestSource: "system",
+            requestText: question,
+            meta: { model: this.config.opencode.modelPrimary, responseLength: text.length },
+          });
           return text;
         }
       }
 
-      return await this.readLatestAssistantMessage();
+      const fallbackMessage = await this.readLatestAssistantMessage();
+      this.audit.record({
+        eventId,
+        component: "llm",
+        action: "prompt_completed",
+        status: "completed",
+        requestSource: "system",
+        requestText: question,
+        meta: {
+          model: this.config.opencode.modelPrimary,
+          responseLength: fallbackMessage.length,
+        },
+      });
+      return fallbackMessage;
     } catch (error) {
       this.logger.warn("Primary model failed, trying fallback model", {
         error: error instanceof Error ? error.message : String(error),
+      });
+      this.audit.record({
+        eventId,
+        component: "llm",
+        action: "primary_model_failed",
+        status: "failed",
+        requestSource: "system",
+        requestText: question,
+        meta: {
+          model: this.config.opencode.modelPrimary,
+          error: error instanceof Error ? error.message : String(error),
+        },
       });
 
       const fallback = this.config.opencode.modelFallback;
@@ -87,10 +136,29 @@ export class OpencodeReasoner {
       if ("data" in response && response.data) {
         const text = collectText(response.data.parts as Array<{ type?: string; text?: string }>);
         if (text) {
+          this.audit.record({
+            eventId,
+            component: "llm",
+            action: "fallback_prompt_completed",
+            status: "completed",
+            requestSource: "system",
+            requestText: question,
+            meta: { model: fallback, responseLength: text.length },
+          });
           return text;
         }
       }
-      return await this.readLatestAssistantMessage();
+      const fallbackMessage = await this.readLatestAssistantMessage();
+      this.audit.record({
+        eventId,
+        component: "llm",
+        action: "fallback_prompt_completed",
+        status: "completed",
+        requestSource: "system",
+        requestText: question,
+        meta: { model: fallback, responseLength: fallbackMessage.length },
+      });
+      return fallbackMessage;
     }
   }
 

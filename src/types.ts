@@ -117,3 +117,27 @@ export interface DeployResult {
   message: string;
   project?: ProjectRecord;
 }
+
+export type AuditComponent =
+  | "slack"
+  | "deploy"
+  | "shell"
+  | "discovery"
+  | "skills"
+  | "llm"
+  | "caddy"
+  | "system";
+
+export type AuditStatus = "started" | "completed" | "failed" | "info";
+
+export interface AuditEventInput {
+  eventId: string;
+  component: AuditComponent;
+  action: string;
+  status?: AuditStatus;
+  actor?: string;
+  channel?: string;
+  requestSource?: string;
+  requestText?: string;
+  meta?: unknown;
+}
