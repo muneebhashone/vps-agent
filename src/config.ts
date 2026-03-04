@@ -8,36 +8,36 @@ const appConfigSchema = z.object({
   slack: z.object({
     appTokenEnv: z.string().default("SLACK_APP_TOKEN"),
     botTokenEnv: z.string().default("SLACK_BOT_TOKEN"),
-  }),
+  }).default({}),
   openrouter: z.object({
     apiKeyEnv: z.string().default("OPENROUTER_API_KEY"),
-  }),
+  }).default({}),
   opencode: z.object({
     modelPrimary: z.string().default("openrouter/openai/gpt-4o-mini"),
     modelFallback: z.string().default("openrouter/openai/gpt-4o-mini"),
     defaultAgent: z.string().default("default"),
-  }),
+  }).default({}),
   paths: z.object({
     dataDir: z.string().default("./data"),
     skillsDir: z.string().default("./skills"),
     deployRoot: z.string().default("/srv/apps"),
-  }),
+  }).default({}),
   projects: z.object({
     discoveryRoots: z.array(z.string()).default(["/srv", "/opt", "/var/www"]),
     baseDomain: z.string().default("example.com"),
     defaultHealthPath: z.string().default("/health"),
     healthTimeoutMs: z.number().int().positive().default(60_000),
     defaultContainerInternalPort: z.number().int().positive().default(3000),
-  }),
+  }).default({}),
   caddy: z.object({
     managedSnippetPath: z
       .string()
       .default("/etc/caddy/conf.d/vps-agent-routes.caddy"),
     reloadCommand: z.string().default("systemctl reload caddy"),
-  }),
+  }).default({}),
   policy: z.object({
     requireApprovalForHighRisk: z.boolean().default(true),
-  }),
+  }).default({}),
 });
 
 const denyRuleSchema = z.object({
@@ -53,7 +53,7 @@ const policySchema = z.object({
   risk: z.object({
     highPatterns: z.array(z.string()).default([]),
     mediumPatterns: z.array(z.string()).default([]),
-  }),
+  }).default({}),
 });
 
 function parseEnvFile(raw: string): Record<string, string> {
