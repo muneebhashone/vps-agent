@@ -1,0 +1,33 @@
+slack:
+  appTokenEnv: SLACK_APP_TOKEN
+  botTokenEnv: SLACK_BOT_TOKEN
+
+openrouter:
+  apiKeyEnv: OPENROUTER_API_KEY
+
+opencode:
+  modelPrimary: openrouter/openai/gpt-4o-mini
+  modelFallback: openrouter/openai/gpt-4o-mini
+  defaultAgent: default
+
+paths:
+  dataDir: ./data
+  skillsDir: ./skills
+  deployRoot: /srv/apps
+
+projects:
+  discoveryRoots:
+    - /srv
+    - /opt
+    - /var/www
+  baseDomain: example.com
+  defaultHealthPath: /health
+  healthTimeoutMs: 60000
+  defaultContainerInternalPort: 3000
+
+caddy:
+  managedSnippetPath: /etc/caddy/conf.d/vps-agent-routes.caddy
+  reloadCommand: systemctl reload caddy
+
+policy:
+  requireApprovalForHighRisk: true
