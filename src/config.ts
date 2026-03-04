@@ -8,36 +8,60 @@ const appConfigSchema = z.object({
   slack: z.object({
     appTokenEnv: z.string().default("SLACK_APP_TOKEN"),
     botTokenEnv: z.string().default("SLACK_BOT_TOKEN"),
-  }).default({}),
+  }).default({
+    appTokenEnv: "SLACK_APP_TOKEN",
+    botTokenEnv: "SLACK_BOT_TOKEN",
+  }),
   openrouter: z.object({
     apiKeyEnv: z.string().default("OPENROUTER_API_KEY"),
-  }).default({}),
+  }).default({
+    apiKeyEnv: "OPENROUTER_API_KEY",
+  }),
   opencode: z.object({
     modelPrimary: z.string().default("openrouter/openai/gpt-4o-mini"),
     modelFallback: z.string().default("openrouter/openai/gpt-4o-mini"),
     defaultAgent: z.string().default("default"),
-  }).default({}),
+  }).default({
+    modelPrimary: "openrouter/openai/gpt-4o-mini",
+    modelFallback: "openrouter/openai/gpt-4o-mini",
+    defaultAgent: "default",
+  }),
   paths: z.object({
     dataDir: z.string().default("./data"),
     skillsDir: z.string().default("./skills"),
     deployRoot: z.string().default("/srv/apps"),
-  }).default({}),
+  }).default({
+    dataDir: "./data",
+    skillsDir: "./skills",
+    deployRoot: "/srv/apps",
+  }),
   projects: z.object({
     discoveryRoots: z.array(z.string()).default(["/srv", "/opt", "/var/www"]),
     baseDomain: z.string().default("example.com"),
     defaultHealthPath: z.string().default("/health"),
     healthTimeoutMs: z.number().int().positive().default(60_000),
     defaultContainerInternalPort: z.number().int().positive().default(3000),
-  }).default({}),
+  }).default({
+    discoveryRoots: ["/srv", "/opt", "/var/www"],
+    baseDomain: "example.com",
+    defaultHealthPath: "/health",
+    healthTimeoutMs: 60_000,
+    defaultContainerInternalPort: 3000,
+  }),
   caddy: z.object({
     managedSnippetPath: z
       .string()
       .default("/etc/caddy/conf.d/vps-agent-routes.caddy"),
     reloadCommand: z.string().default("systemctl reload caddy"),
-  }).default({}),
+  }).default({
+    managedSnippetPath: "/etc/caddy/conf.d/vps-agent-routes.caddy",
+    reloadCommand: "systemctl reload caddy",
+  }),
   policy: z.object({
     requireApprovalForHighRisk: z.boolean().default(true),
-  }).default({}),
+  }).default({
+    requireApprovalForHighRisk: true,
+  }),
 });
 
 const denyRuleSchema = z.object({
@@ -53,7 +77,10 @@ const policySchema = z.object({
   risk: z.object({
     highPatterns: z.array(z.string()).default([]),
     mediumPatterns: z.array(z.string()).default([]),
-  }).default({}),
+  }).default({
+    highPatterns: [],
+    mediumPatterns: [],
+  }),
 });
 
 function parseEnvFile(raw: string): Record<string, string> {

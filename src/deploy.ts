@@ -1,10 +1,12 @@
 import { access, mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import net from "node:net";
+import type { AuditService } from "./audit";
 import type { CaddyManager } from "./caddy";
 import type { AgentDatabase } from "./db";
 import type { ProjectDiscoveryService } from "./discovery";
 import type { Logger } from "./logger";
+import { redactSecretsInString } from "./redaction";
 import type { ShellExecutor } from "./shell";
 import type { AppConfig, DeployResult, ProjectRecord } from "./types";
 
@@ -20,13 +22,25 @@ function isGitUrl(input: string): boolean {
   );
 }
 
-function gitBinaryForRepo(repoUrl: string): string {
-  const hasToken = Boolean(process.env.GITHUB_TOKEN);
-  const isGitHubHttps = /^https?:\/\/github\.com\//i.test(repoUrl);
-  if (hasToken && isGitHubHttps) {
-    return 'git -c http.extraHeader="Authorization: Bearer $GITHUB_TOKEN"';
+function isGitHubHttpsUrl(repoUrl: string): boolean {
+  return /^https?:\/\/github\.com\//i.test(repoUrl);
+}
+
+function normalizeRepoUrl(repoUrl: string): string {
+  return repoUrl.replace(/^https?:\/\/[^@\s/]+@/i, "https://");
+}
+
+function applyGitHubToken(repoUrl: string): string {
+  const token = process.env.GITHUB_TOKEN?.trim();
+  if (!token || !isGitHubHttpsUrl(repoUrl)) {
+    return repoUrl;
   }
-  return "git";
+
+  const normalized = normalizeRepoUrl(repoUrl);
+  return normalized.replace(
+    /^https?:\/\//i,
+    `https://x-access-token:${encodeURIComponent(token)}@`
+  );
 }
 
 function projectNameFromInput(value: string): string {
@@ -42,6 +56,15 @@ function projectNameFromInput(value: string): string {
     .replace(/[^a-z0-9-]/g, "-")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "");
+}
+
+function failureReason(
+  stderr?: string,
+  error?: string,
+  blockedBy?: string,
+  fallback = "unknown error"
+): string {
+  return redactSecretsInString(stderr || error || blockedBy || fallback);
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -141,7 +164,8 @@ export class DeployManager {
     private readonly shell: ShellExecutor,
     private readonly discovery: ProjectDiscoveryService,
     private readonly caddy: CaddyManager,
-    private readonly logger: Logger
+    private readonly logger: Logger,
+    private readonly audit: AuditService
   ) {}
 
   async deploy(
@@ -150,11 +174,52 @@ export class DeployManager {
     channel: string,
     branch?: string
   ): Promise<DeployResult> {
-    const resolution = await this.resolveProjectPath(repoOrPath, actor, channel, branch);
+    const eventId = this.audit.createEventId();
+    this.audit.record({
+      eventId,
+      component: "deploy",
+      action: "deploy_started",
+      status: "started",
+      actor,
+      channel,
+      requestSource: "slash",
+      requestText: repoOrPath,
+      meta: { branch },
+    });
+
+    const resolution = await this.resolveProjectPath(
+      repoOrPath,
+      actor,
+      channel,
+      branch,
+      eventId
+    );
     if (!resolution.success) {
+      this.audit.record({
+        eventId,
+        component: "deploy",
+        action: "deploy_failed",
+        status: "failed",
+        actor,
+        channel,
+        requestSource: "slash",
+        requestText: repoOrPath,
+        meta: { branch, reason: resolution.message },
+      });
       return resolution;
     }
     if (!resolution.path) {
+      this.audit.record({
+        eventId,
+        component: "deploy",
+        action: "deploy_failed",
+        status: "failed",
+        actor,
+        channel,
+        requestSource: "slash",
+        requestText: repoOrPath,
+        meta: { branch, reason: "project_path_resolution_missing" },
+      });
       return {
         success: false,
         message: "Project path resolution failed unexpectedly.",
@@ -165,6 +230,22 @@ export class DeployManager {
     const projectName = projectNameFromInput(projectPath);
     const domain = `${projectName}.${this.config.projects.baseDomain}`;
     const detection = await this.discovery.detectProject(projectPath);
+    this.audit.record({
+      eventId,
+      component: "deploy",
+      action: "stack_detected",
+      status: "completed",
+      actor,
+      channel,
+      requestSource: "slash",
+      requestText: repoOrPath,
+      meta: {
+        projectPath,
+        stack: detection.stack,
+        runModel: detection.runModel,
+        reason: detection.reason,
+      },
+    });
 
     const baseProject: Omit<ProjectRecord, "updatedAt"> = {
       name: projectName,
@@ -186,6 +267,22 @@ export class DeployManager {
         "failed",
         `Detected ${detection.stack} stack (${detection.reason}) but deploy automation is only implemented for docker/docker-compose in this version.`
       );
+      this.audit.record({
+        eventId,
+        component: "deploy",
+        action: "deploy_failed",
+        status: "failed",
+        actor,
+        channel,
+        requestSource: "slash",
+        requestText: repoOrPath,
+        meta: {
+          projectName,
+          stack: detection.stack,
+          runModel: detection.runModel,
+          reason: detection.reason,
+        },
+      });
       return {
         success: false,
         message:
@@ -199,6 +296,17 @@ export class DeployManager {
     let rollbackCommand: string | undefined;
 
     if (detection.runModel === "docker-compose") {
+      this.audit.record({
+        eventId,
+        component: "deploy",
+        action: "compose_up_started",
+        status: "started",
+        actor,
+        channel,
+        requestSource: "slash",
+        requestText: repoOrPath,
+        meta: { projectPath },
+      });
       const up = await this.shell.run({
         actor,
         channel,
@@ -211,15 +319,37 @@ export class DeployManager {
         this.db.recordDeployment(
           projectName,
           "failed",
-          `docker compose up failed: ${up.stderr || up.error || up.blockedBy || "unknown"}`
+          `docker compose up failed: ${failureReason(up.stderr, up.error, up.blockedBy, "unknown")}`
         );
+        this.audit.record({
+          eventId,
+          component: "deploy",
+          action: "compose_up_failed",
+          status: "failed",
+          actor,
+          channel,
+          requestSource: "slash",
+          requestText: repoOrPath,
+          meta: { projectPath, result: up },
+        });
         return {
           success: false,
-          message: `Deploy failed while running docker compose up: ${up.stderr || up.error || up.blockedBy || "unknown error"}`,
+          message: `Deploy failed while running docker compose up: ${failureReason(up.stderr, up.error, up.blockedBy)}`,
         };
       }
 
       rollbackCommand = "docker compose down";
+      this.audit.record({
+        eventId,
+        component: "deploy",
+        action: "compose_up_completed",
+        status: "completed",
+        actor,
+        channel,
+        requestSource: "slash",
+        requestText: repoOrPath,
+        meta: { projectPath },
+      });
 
       const portResult = await this.shell.run({
         actor,
@@ -242,6 +372,17 @@ export class DeployManager {
       );
       const freePort = await findFreePort(20000, 29999, usedPorts);
       if (!freePort) {
+        this.audit.record({
+          eventId,
+          component: "deploy",
+          action: "port_allocation_failed",
+          status: "failed",
+          actor,
+          channel,
+          requestSource: "slash",
+          requestText: repoOrPath,
+          meta: { range: "20000-29999" },
+        });
         return { success: false, message: "No free port found in 20000-29999." };
       }
       port = freePort;
@@ -258,9 +399,20 @@ export class DeployManager {
         command: `docker build -t ${shellQuote(imageName)} .`,
       });
       if (build.status !== "completed") {
+        this.audit.record({
+          eventId,
+          component: "deploy",
+          action: "docker_build_failed",
+          status: "failed",
+          actor,
+          channel,
+          requestSource: "slash",
+          requestText: repoOrPath,
+          meta: { projectPath, result: build },
+        });
         return {
           success: false,
-          message: `docker build failed: ${build.stderr || build.error || build.blockedBy || "unknown error"}`,
+          message: `docker build failed: ${failureReason(build.stderr, build.error, build.blockedBy)}`,
         };
       }
 
@@ -274,9 +426,20 @@ export class DeployManager {
           `docker run -d --name ${shellQuote(containerName)} -p ${port}:${this.config.projects.defaultContainerInternalPort} ${shellQuote(imageName)}`,
       });
       if (run.status !== "completed") {
+        this.audit.record({
+          eventId,
+          component: "deploy",
+          action: "docker_run_failed",
+          status: "failed",
+          actor,
+          channel,
+          requestSource: "slash",
+          requestText: repoOrPath,
+          meta: { projectPath, result: run },
+        });
         return {
           success: false,
-          message: `docker run failed: ${run.stderr || run.error || run.blockedBy || "unknown error"}`,
+          message: `docker run failed: ${failureReason(run.stderr, run.error, run.blockedBy)}`,
         };
       }
     }
@@ -293,6 +456,17 @@ export class DeployManager {
     }
 
     if (!port) {
+      this.audit.record({
+        eventId,
+        component: "deploy",
+        action: "port_detection_failed",
+        status: "failed",
+        actor,
+        channel,
+        requestSource: "slash",
+        requestText: repoOrPath,
+        meta: { projectPath, runModel: detection.runModel },
+      });
       return {
         success: false,
         message:
@@ -323,6 +497,17 @@ export class DeployManager {
         `Healthcheck failed on ${healthUrl}`,
         revision
       );
+      this.audit.record({
+        eventId,
+        component: "deploy",
+        action: "healthcheck_failed",
+        status: "failed",
+        actor,
+        channel,
+        requestSource: "slash",
+        requestText: repoOrPath,
+        meta: { healthUrl, revision, rollbackCommand },
+      });
       return {
         success: false,
         message: `Healthcheck failed on ${healthUrl}; deployment rolled back.`,
@@ -354,6 +539,17 @@ export class DeployManager {
         `Caddy update failed: ${caddyApply.error}`,
         revision
       );
+      this.audit.record({
+        eventId,
+        component: "deploy",
+        action: "caddy_apply_failed",
+        status: "failed",
+        actor,
+        channel,
+        requestSource: "slash",
+        requestText: repoOrPath,
+        meta: { projectName, revision, error: caddyApply.error },
+      });
       return {
         success: false,
         message: `Deploy failed while reloading caddy. Rollback executed. ${caddyApply.error}`,
@@ -367,6 +563,17 @@ export class DeployManager {
       revision
     );
     this.logger.info("Deploy completed", { projectName, domain, port, revision });
+    this.audit.record({
+      eventId,
+      component: "deploy",
+      action: "deploy_completed",
+      status: "completed",
+      actor,
+      channel,
+      requestSource: "slash",
+      requestText: repoOrPath,
+      meta: { projectName, domain, port, revision },
+    });
 
     return {
       success: true,
@@ -379,7 +586,8 @@ export class DeployManager {
     repoOrPath: string,
     actor: string,
     channel: string,
-    branch?: string
+    branch?: string,
+    eventId?: string
   ): Promise<DeployResult & { path?: string; repoUrl?: string }> {
     if (!isGitUrl(repoOrPath)) {
       const absolute = resolve(repoOrPath);
@@ -397,48 +605,146 @@ export class DeployManager {
     }
 
     await mkdir(this.config.paths.deployRoot, { recursive: true });
-    const projectName = projectNameFromInput(repoOrPath);
+    const cleanRepoUrl = normalizeRepoUrl(repoOrPath);
+    const repoUrlWithToken = applyGitHubToken(cleanRepoUrl);
+    const projectName = projectNameFromInput(cleanRepoUrl);
     const targetPath = join(resolve(this.config.paths.deployRoot), projectName);
     const hasGit = await exists(join(targetPath, ".git"));
+    if (eventId) {
+      this.audit.record({
+        eventId,
+        component: "deploy",
+        action: hasGit ? "repo_update_started" : "repo_clone_started",
+        status: "started",
+        actor,
+        channel,
+        requestSource: "slash",
+        requestText: cleanRepoUrl,
+        meta: { targetPath, branch: branch ?? "main" },
+      });
+    }
 
     if (!hasGit) {
-      const git = gitBinaryForRepo(repoOrPath);
       const clone = await this.shell.run({
         actor,
         channel,
         source: "slash",
-        command: `${git} clone ${shellQuote(repoOrPath)} ${shellQuote(targetPath)}`,
+        command: `git clone ${shellQuote(repoUrlWithToken)} ${shellQuote(targetPath)}`,
       });
       if (clone.status !== "completed") {
+        if (eventId) {
+          this.audit.record({
+            eventId,
+            component: "deploy",
+            action: "repo_clone_failed",
+            status: "failed",
+            actor,
+            channel,
+            requestSource: "slash",
+            requestText: cleanRepoUrl,
+            meta: { targetPath, result: clone },
+          });
+        }
         return {
           success: false,
-          message: `Failed to clone repo: ${clone.stderr || clone.error || clone.blockedBy || "unknown error"}`,
+          message: `Failed to clone repo: ${failureReason(clone.stderr, clone.error, clone.blockedBy)}`,
         };
       }
     } else {
-      const git = gitBinaryForRepo(repoOrPath);
+      const setRemote = await this.shell.run({
+        actor,
+        channel,
+        source: "slash",
+        cwd: targetPath,
+        command: `git remote set-url origin ${shellQuote(repoUrlWithToken)}`,
+      });
+      if (setRemote.status !== "completed") {
+        if (eventId) {
+          this.audit.record({
+            eventId,
+            component: "deploy",
+            action: "repo_update_failed",
+            status: "failed",
+            actor,
+            channel,
+            requestSource: "slash",
+            requestText: cleanRepoUrl,
+            meta: { targetPath, reason: "set_remote_failed", result: setRemote },
+          });
+        }
+        return {
+          success: false,
+          message: `Failed to set repository origin URL: ${failureReason(setRemote.stderr, setRemote.error, setRemote.blockedBy)}`,
+        };
+      }
+
       const pull = await this.shell.run({
         actor,
         channel,
         source: "slash",
         cwd: targetPath,
-        command: `${git} fetch --all --prune && ${git} checkout ${shellQuote(branch ?? "main")} && ${git} pull --ff-only`,
+        command: `git fetch --all --prune && git checkout ${shellQuote(branch ?? "main")} && git pull --ff-only`,
       });
       if (pull.status !== "completed") {
+        if (eventId) {
+          this.audit.record({
+            eventId,
+            component: "deploy",
+            action: "repo_update_failed",
+            status: "failed",
+            actor,
+            channel,
+            requestSource: "slash",
+            requestText: cleanRepoUrl,
+            meta: { targetPath, branch: branch ?? "main", result: pull },
+          });
+        }
         return {
           success: false,
-          message: `Failed to update repo: ${pull.stderr || pull.error || pull.blockedBy || "unknown error"}`,
+          message: `Failed to update repo: ${failureReason(pull.stderr, pull.error, pull.blockedBy)}`,
         };
       }
     }
 
-    if (branch && hasGit) {
-      await this.shell.run({
+    if (branch) {
+      const checkout = await this.shell.run({
         actor,
         channel,
         source: "slash",
         cwd: targetPath,
-        command: `${gitBinaryForRepo(repoOrPath)} checkout ${shellQuote(branch)}`,
+        command: `git checkout ${shellQuote(branch)}`,
+      });
+      if (checkout.status !== "completed") {
+        if (eventId) {
+          this.audit.record({
+            eventId,
+            component: "deploy",
+            action: "branch_checkout_failed",
+            status: "failed",
+            actor,
+            channel,
+            requestSource: "slash",
+            requestText: cleanRepoUrl,
+            meta: { targetPath, branch, result: checkout },
+          });
+        }
+        return {
+          success: false,
+          message: `Failed to checkout branch ${branch}: ${failureReason(checkout.stderr, checkout.error, checkout.blockedBy)}`,
+        };
+      }
+    }
+    if (eventId) {
+      this.audit.record({
+        eventId,
+        component: "deploy",
+        action: hasGit ? "repo_update_completed" : "repo_clone_completed",
+        status: "completed",
+        actor,
+        channel,
+        requestSource: "slash",
+        requestText: cleanRepoUrl,
+        meta: { targetPath, branch: branch ?? "main" },
       });
     }
 
@@ -446,7 +752,7 @@ export class DeployManager {
       success: true,
       message: `Prepared repository at ${targetPath}`,
       path: targetPath,
-      repoUrl: repoOrPath,
+      repoUrl: cleanRepoUrl,
     };
   }
 }

@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
+import type { AuditService } from "./audit";
 import type { AgentDatabase } from "./db";
 import type { Logger } from "./logger";
+import { redactSecretsInString } from "./redaction";
 import type { PolicyEngine } from "./policy";
 import type { CommandRequest, CommandResult } from "./types";
 
@@ -9,10 +11,23 @@ export class ShellExecutor {
     private readonly policy: PolicyEngine,
     private readonly db: AgentDatabase,
     private readonly logger: Logger,
+    private readonly audit: AuditService,
     private readonly requireApprovalForHighRisk: boolean
   ) {}
 
   async run(request: CommandRequest): Promise<CommandResult> {
+    const eventId = this.audit.createEventId();
+    this.audit.record({
+      eventId,
+      component: "shell",
+      action: "command_received",
+      status: "started",
+      actor: request.actor,
+      channel: request.channel,
+      requestSource: request.source,
+      requestText: request.command,
+      meta: { cwd: request.cwd, bypassApproval: request.bypassApproval },
+    });
     const decision = this.policy.evaluate(request.command);
 
     if (!decision.allowed) {
@@ -23,6 +38,17 @@ export class ShellExecutor {
         blockedBy: decision.blockedBy,
       };
       this.db.recordCommand(request.actor, request.channel, request.source, denied);
+      this.audit.record({
+        eventId,
+        component: "shell",
+        action: "command_denied",
+        status: "failed",
+        actor: request.actor,
+        channel: request.channel,
+        requestSource: request.source,
+        requestText: request.command,
+        meta: { blockedBy: decision.blockedBy, riskLevel: decision.riskLevel },
+      });
       return denied;
     }
 
@@ -48,10 +74,21 @@ export class ShellExecutor {
         approvalId,
       };
       this.db.recordCommand(request.actor, request.channel, request.source, waiting);
+      this.audit.record({
+        eventId,
+        component: "shell",
+        action: "approval_required",
+        status: "info",
+        actor: request.actor,
+        channel: request.channel,
+        requestSource: request.source,
+        requestText: request.command,
+        meta: { approvalId, riskLevel: decision.riskLevel },
+      });
       return waiting;
     }
 
-    return this.execute(request, decision.riskLevel);
+    return this.execute(request, decision.riskLevel, eventId);
   }
 
   async approveAndRun(
@@ -72,7 +109,8 @@ export class ShellExecutor {
         command: approval.command,
         bypassApproval: true,
       },
-      approval.riskLevel
+      approval.riskLevel,
+      this.audit.createEventId()
     );
     this.db.setApprovalStatus(approvalId, "executed", approvedBy);
     return result;
@@ -89,15 +127,27 @@ export class ShellExecutor {
 
   private async execute(
     request: CommandRequest,
-    riskLevel: CommandResult["riskLevel"]
+    riskLevel: CommandResult["riskLevel"],
+    eventId: string
   ): Promise<CommandResult> {
     this.logger.info("Executing shell command", {
       actor: request.actor,
       channel: request.channel,
       source: request.source,
       riskLevel,
-      command: request.command,
+      command: redactSecretsInString(request.command),
       cwd: request.cwd,
+    });
+    this.audit.record({
+      eventId,
+      component: "shell",
+      action: "command_execution_started",
+      status: "started",
+      actor: request.actor,
+      channel: request.channel,
+      requestSource: request.source,
+      requestText: request.command,
+      meta: { riskLevel, cwd: request.cwd },
     });
 
     try {
@@ -124,6 +174,22 @@ export class ShellExecutor {
       };
 
       this.db.recordCommand(request.actor, request.channel, request.source, result);
+      this.audit.record({
+        eventId,
+        component: "shell",
+        action: "command_execution_completed",
+        status: exitCode === 0 ? "completed" : "failed",
+        actor: request.actor,
+        channel: request.channel,
+        requestSource: request.source,
+        requestText: request.command,
+        meta: {
+          riskLevel,
+          exitCode,
+          stdout: truncate(stdout),
+          stderr: truncate(stderr),
+        },
+      });
       return result;
     } catch (error) {
       const failed: CommandResult = {
@@ -133,6 +199,20 @@ export class ShellExecutor {
         error: error instanceof Error ? error.message : String(error),
       };
       this.db.recordCommand(request.actor, request.channel, request.source, failed);
+      this.audit.record({
+        eventId,
+        component: "shell",
+        action: "command_execution_error",
+        status: "failed",
+        actor: request.actor,
+        channel: request.channel,
+        requestSource: request.source,
+        requestText: request.command,
+        meta: {
+          riskLevel,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      });
       return failed;
     }
   }

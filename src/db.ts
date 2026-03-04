@@ -1,7 +1,13 @@
 import { mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { Database } from "bun:sqlite";
-import type { CommandResult, ProjectRecord, RiskLevel } from "./types";
+import { redactSecretsInString, redactUnknown, truncateText } from "./redaction";
+import type {
+  AuditEventInput,
+  CommandResult,
+  ProjectRecord,
+  RiskLevel,
+} from "./types";
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -75,6 +81,20 @@ export class AgentDatabase {
         requested_at TEXT NOT NULL,
         handled_by TEXT,
         handled_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS audit_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL,
+        ts TEXT NOT NULL,
+        component TEXT NOT NULL,
+        action TEXT NOT NULL,
+        status TEXT,
+        actor TEXT,
+        channel TEXT,
+        request_source TEXT,
+        request_text TEXT,
+        meta_json TEXT
       );
     `);
   }
@@ -172,6 +192,17 @@ export class AgentDatabase {
     source: string,
     result: CommandResult
   ) {
+    const safeCommand = truncateText(redactSecretsInString(result.command), 2_000);
+    const safeStdout = result.stdout
+      ? truncateText(redactSecretsInString(result.stdout), 8_000)
+      : null;
+    const safeStderr = result.stderr
+      ? truncateText(redactSecretsInString(result.stderr), 8_000)
+      : null;
+    const safeError = result.error
+      ? truncateText(redactSecretsInString(result.error), 2_000)
+      : null;
+
     this.db
       .query(
         `
@@ -186,15 +217,45 @@ export class AgentDatabase {
         $actor: actor,
         $channel: channel,
         $source: source,
-        $command: result.command,
+        $command: safeCommand,
         $riskLevel: result.riskLevel,
         $status: result.status,
-        $blockedBy: result.blockedBy ?? null,
+        $blockedBy: result.blockedBy
+          ? redactSecretsInString(result.blockedBy)
+          : null,
         $exitCode: result.exitCode ?? null,
-        $stdout: result.stdout ?? null,
-        $stderr: result.stderr ?? null,
-        $error: result.error ?? null,
+        $stdout: safeStdout,
+        $stderr: safeStderr,
+        $error: safeError,
         $createdAt: nowIso(),
+      });
+  }
+
+  recordAuditEvent(event: AuditEventInput) {
+    const meta = redactUnknown(event.meta);
+    this.db
+      .query(
+        `
+      INSERT INTO audit_events(
+        event_id, ts, component, action, status, actor, channel, request_source, request_text, meta_json
+      ) VALUES (
+        $eventId, $ts, $component, $action, $status, $actor, $channel, $requestSource, $requestText, $metaJson
+      );
+      `
+      )
+      .run({
+        $eventId: event.eventId,
+        $ts: nowIso(),
+        $component: event.component,
+        $action: event.action,
+        $status: event.status ?? "info",
+        $actor: event.actor ?? null,
+        $channel: event.channel ?? null,
+        $requestSource: event.requestSource ?? null,
+        $requestText: event.requestText
+          ? truncateText(redactSecretsInString(event.requestText), 4_000)
+          : null,
+        $metaJson: meta ? JSON.stringify(meta) : null,
       });
   }
 

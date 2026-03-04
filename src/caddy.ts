@@ -1,5 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import type { AuditService } from "./audit";
 import type { AgentDatabase } from "./db";
 import type { Logger } from "./logger";
 import type { AppConfig } from "./types";
@@ -12,10 +13,20 @@ export class CaddyManager {
   constructor(
     private readonly config: AppConfig,
     private readonly db: AgentDatabase,
-    private readonly logger: Logger
+    private readonly logger: Logger,
+    private readonly audit: AuditService
   ) {}
 
   async applyRoutes(): Promise<{ ok: boolean; error?: string }> {
+    const eventId = this.audit.createEventId();
+    this.audit.record({
+      eventId,
+      component: "caddy",
+      action: "apply_routes_started",
+      status: "started",
+      requestSource: "system",
+      meta: { snippetPath: this.config.caddy.managedSnippetPath },
+    });
     const projects = this.db.listProjects().filter((project) => project.port);
     const snippetPath = this.config.caddy.managedSnippetPath;
 
@@ -50,6 +61,14 @@ export class CaddyManager {
 
     if (exitCode !== 0) {
       await writeFile(snippetPath, previous, "utf8");
+      this.audit.record({
+        eventId,
+        component: "caddy",
+        action: "apply_routes_failed",
+        status: "failed",
+        requestSource: "system",
+        meta: { exitCode, stdout, stderr },
+      });
       return {
         ok: false,
         error: `Failed to reload caddy (exit ${exitCode}): ${stderr || stdout}`,
@@ -64,11 +83,24 @@ export class CaddyManager {
       snippetPath,
       command: this.config.caddy.reloadCommand,
     });
+    this.audit.record({
+      eventId,
+      component: "caddy",
+      action: "apply_routes_completed",
+      status: "completed",
+      requestSource: "system",
+      meta: {
+        routeCount: projects.length,
+        snippetPath,
+        command: this.config.caddy.reloadCommand,
+      },
+    });
 
     return { ok: true };
   }
 
   async rollbackRoutes(previousContent: string): Promise<void> {
+    const eventId = this.audit.createEventId();
     const snippetPath = this.config.caddy.managedSnippetPath;
     await mkdir(dirname(snippetPath), { recursive: true });
     await writeFile(snippetPath, previousContent, "utf8");
@@ -80,6 +112,14 @@ export class CaddyManager {
 
     this.logger.warn("Rolled back caddy routes", {
       snippetPath: shellQuote(snippetPath),
+    });
+    this.audit.record({
+      eventId,
+      component: "caddy",
+      action: "rollback_routes_completed",
+      status: "completed",
+      requestSource: "system",
+      meta: { snippetPath, previousLength: previousContent.length },
     });
   }
 }

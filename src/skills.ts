@@ -1,5 +1,6 @@
 import { access, readdir, readFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
+import type { AuditService } from "./audit";
 import type { Logger } from "./logger";
 import type { ShellExecutor } from "./shell";
 import type { AppConfig, CommandResult } from "./types";
@@ -30,13 +31,31 @@ export class SkillManager {
   constructor(
     private readonly config: AppConfig,
     private readonly shell: ShellExecutor,
-    private readonly logger: Logger
+    private readonly logger: Logger,
+    private readonly audit: AuditService
   ) {
     this.skillsRoot = resolve(config.paths.skillsDir);
   }
 
   async listSkills(): Promise<SkillInfo[]> {
+    const eventId = this.audit.createEventId();
+    this.audit.record({
+      eventId,
+      component: "skills",
+      action: "list_skills_started",
+      status: "started",
+      requestSource: "system",
+      meta: { root: this.skillsRoot },
+    });
     if (!(await exists(this.skillsRoot))) {
+      this.audit.record({
+        eventId,
+        component: "skills",
+        action: "list_skills_completed",
+        status: "completed",
+        requestSource: "system",
+        meta: { root: this.skillsRoot, count: 0 },
+      });
       return [];
     }
 
@@ -65,7 +84,16 @@ export class SkillManager {
       });
     }
 
-    return skills.sort((a, b) => a.name.localeCompare(b.name));
+    const sorted = skills.sort((a, b) => a.name.localeCompare(b.name));
+    this.audit.record({
+      eventId,
+      component: "skills",
+      action: "list_skills_completed",
+      status: "completed",
+      requestSource: "system",
+      meta: { root: this.skillsRoot, count: sorted.length },
+    });
+    return sorted;
   }
 
   async runSkill(
@@ -74,14 +102,48 @@ export class SkillManager {
     actor: string,
     channel: string
   ): Promise<CommandResult | { status: "failed"; error: string }> {
+    const eventId = this.audit.createEventId();
+    this.audit.record({
+      eventId,
+      component: "skills",
+      action: "run_skill_started",
+      status: "started",
+      actor,
+      channel,
+      requestSource: "slash",
+      requestText: skillName,
+      meta: { args },
+    });
     const skillPath = join(this.skillsRoot, skillName);
     const docPath = join(skillPath, "SKILL.md");
     if (!(await exists(docPath))) {
+      this.audit.record({
+        eventId,
+        component: "skills",
+        action: "run_skill_failed",
+        status: "failed",
+        actor,
+        channel,
+        requestSource: "slash",
+        requestText: skillName,
+        meta: { reason: "skill_not_found" },
+      });
       return { status: "failed", error: `Skill not found: ${skillName}` };
     }
 
     const scriptsPath = join(skillPath, "scripts");
     if (!(await exists(scriptsPath))) {
+      this.audit.record({
+        eventId,
+        component: "skills",
+        action: "run_skill_failed",
+        status: "failed",
+        actor,
+        channel,
+        requestSource: "slash",
+        requestText: skillName,
+        meta: { reason: "missing_scripts_directory", path: scriptsPath },
+      });
       return {
         status: "failed",
         error:
@@ -95,6 +157,17 @@ export class SkillManager {
       .map((entry) => entry.name);
 
     if (scriptFiles.length === 0) {
+      this.audit.record({
+        eventId,
+        component: "skills",
+        action: "run_skill_failed",
+        status: "failed",
+        actor,
+        channel,
+        requestSource: "slash",
+        requestText: skillName,
+        meta: { reason: "no_script_files", path: scriptsPath },
+      });
       return {
         status: "failed",
         error: `Skill ${skillName} has no executable scripts in ${scriptsPath}.`,
@@ -125,6 +198,17 @@ export class SkillManager {
       actor,
       channel,
       status: run.status,
+    });
+    this.audit.record({
+      eventId,
+      component: "skills",
+      action: "run_skill_completed",
+      status: run.status === "completed" ? "completed" : "failed",
+      actor,
+      channel,
+      requestSource: "slash",
+      requestText: skillName,
+      meta: { script: selected, result: run },
     });
     return run;
   }

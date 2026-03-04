@@ -1,5 +1,6 @@
 import { access, readdir, stat } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
+import type { AuditService } from "./audit";
 import type { AgentDatabase } from "./db";
 import type { Logger } from "./logger";
 import type {
@@ -190,67 +191,113 @@ export class ProjectDiscoveryService {
   constructor(
     private readonly config: AppConfig,
     private readonly db: AgentDatabase,
-    private readonly logger: Logger
+    private readonly logger: Logger,
+    private readonly audit: AuditService
   ) {}
 
   async discoverAndPersist(): Promise<ProjectRecord[]> {
-    const uniquePaths = new Set<string>();
-
-    for (const root of this.config.projects.discoveryRoots) {
-      const resolvedRoot = resolve(root);
-      const exists = await pathExists(resolvedRoot);
-      if (!exists) {
-        continue;
-      }
-      const info = await stat(resolvedRoot);
-      if (!info.isDirectory()) {
-        continue;
-      }
-
-      const repos = await listGitRepos(resolvedRoot);
-      for (const repoPath of repos) {
-        uniquePaths.add(resolve(repoPath));
-      }
-    }
-
-    const discovered: ProjectRecord[] = [];
-
-    for (const projectPath of uniquePaths) {
-      const detection = await detectStack(projectPath);
-      const name = toProjectName(projectPath);
-      const domain = `${name}.${this.config.projects.baseDomain}`;
-      const repoUrl = await resolveRemoteUrl(projectPath);
-
-      const project: Omit<ProjectRecord, "updatedAt"> = {
-        name,
-        path: projectPath,
-        repoUrl,
-        branch: undefined,
-        stackType: detection.stack,
-        runModel: detection.runModel,
-        domain,
-        port: undefined,
-        healthPath: this.config.projects.defaultHealthPath,
-        status: "unknown",
-      };
-
-      this.db.upsertProject(project);
-      discovered.push({
-        ...project,
-        updatedAt: new Date().toISOString(),
-      });
-    }
-
-    this.logger.info("Project discovery completed", {
-      discoveredCount: discovered.length,
-      roots: this.config.projects.discoveryRoots,
+    const eventId = this.audit.createEventId();
+    this.audit.record({
+      eventId,
+      component: "discovery",
+      action: "discovery_started",
+      status: "started",
+      requestSource: "system",
+      meta: { roots: this.config.projects.discoveryRoots },
     });
+    try {
+      const uniquePaths = new Set<string>();
 
-    return discovered;
+      for (const root of this.config.projects.discoveryRoots) {
+        const resolvedRoot = resolve(root);
+        const exists = await pathExists(resolvedRoot);
+        if (!exists) {
+          continue;
+        }
+        const info = await stat(resolvedRoot);
+        if (!info.isDirectory()) {
+          continue;
+        }
+
+        const repos = await listGitRepos(resolvedRoot);
+        for (const repoPath of repos) {
+          uniquePaths.add(resolve(repoPath));
+        }
+      }
+
+      const discovered: ProjectRecord[] = [];
+
+      for (const projectPath of uniquePaths) {
+        const detection = await detectStack(projectPath);
+        const name = toProjectName(projectPath);
+        const domain = `${name}.${this.config.projects.baseDomain}`;
+        const repoUrl = await resolveRemoteUrl(projectPath);
+
+        const project: Omit<ProjectRecord, "updatedAt"> = {
+          name,
+          path: projectPath,
+          repoUrl,
+          branch: undefined,
+          stackType: detection.stack,
+          runModel: detection.runModel,
+          domain,
+          port: undefined,
+          healthPath: this.config.projects.defaultHealthPath,
+          status: "unknown",
+        };
+
+        this.db.upsertProject(project);
+        discovered.push({
+          ...project,
+          updatedAt: new Date().toISOString(),
+        });
+      }
+
+      this.logger.info("Project discovery completed", {
+        discoveredCount: discovered.length,
+        roots: this.config.projects.discoveryRoots,
+      });
+      this.audit.record({
+        eventId,
+        component: "discovery",
+        action: "discovery_completed",
+        status: "completed",
+        requestSource: "system",
+        meta: {
+          roots: this.config.projects.discoveryRoots,
+          discoveredCount: discovered.length,
+        },
+      });
+
+      return discovered;
+    } catch (error) {
+      this.audit.record({
+        eventId,
+        component: "discovery",
+        action: "discovery_failed",
+        status: "failed",
+        requestSource: "system",
+        meta: {
+          roots: this.config.projects.discoveryRoots,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      });
+      throw error;
+    }
   }
 
   async detectProject(projectPath: string): Promise<ProjectDetection> {
-    return detectStack(projectPath);
+    const detection = await detectStack(projectPath);
+    this.audit.record({
+      eventId: this.audit.createEventId(),
+      component: "discovery",
+      action: "stack_detected",
+      status: "completed",
+      requestSource: "system",
+      requestText: projectPath,
+      meta: detection,
+    });
+    return detection;
   }
 }
 

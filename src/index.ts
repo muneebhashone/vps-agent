@@ -1,4 +1,5 @@
 import { join, resolve } from "node:path";
+import { AuditService } from "./audit";
 import { loadConfiguration, requireEnv } from "./config";
 import { AgentDatabase } from "./db";
 import { DeployManager } from "./deploy";
@@ -30,25 +31,33 @@ async function main() {
 
   const dbPath = resolve(join(loaded.app.paths.dataDir, "agent.db"));
   const db = new AgentDatabase(dbPath);
+  const audit = new AuditService(logger, db);
   const policy = new PolicyEngine(loaded.policy, loaded.policyPath);
   const shell = new ShellExecutor(
     policy,
     db,
     logger,
+    audit,
     loaded.app.policy.requireApprovalForHighRisk
   );
-  const discovery = new ProjectDiscoveryService(loaded.app, db, logger);
-  const caddy = new (await import("./caddy")).CaddyManager(loaded.app, db, logger);
+  const discovery = new ProjectDiscoveryService(loaded.app, db, logger, audit);
+  const caddy = new (await import("./caddy")).CaddyManager(
+    loaded.app,
+    db,
+    logger,
+    audit
+  );
   const deploy = new DeployManager(
     loaded.app,
     db,
     shell,
     discovery,
     caddy,
-    logger
+    logger,
+    audit
   );
-  const skills = new SkillManager(loaded.app, shell, logger);
-  const reasoner = new OpencodeReasoner(loaded.app, logger);
+  const skills = new SkillManager(loaded.app, shell, logger, audit);
+  const reasoner = new OpencodeReasoner(loaded.app, logger, audit);
   const slack = new SlackAgent(
     loaded.app,
     db,
@@ -58,7 +67,8 @@ async function main() {
     deploy,
     skills,
     reasoner,
-    logger
+    logger,
+    audit
   );
 
   process.on("SIGINT", async () => {
