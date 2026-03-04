@@ -1,0 +1,35 @@
+denied:
+  - id: rm-root
+    kind: regex
+    pattern: "(^|\\s)rm\\s+-rf\\s+/(\\s|$)"
+    description: Prevent recursive delete of root filesystem.
+    enabled: true
+  - id: mkfs-block
+    kind: regex
+    pattern: "(^|\\s)mkfs(\\.[a-z0-9]+)?\\s+"
+    description: Prevent filesystem formatting.
+    enabled: true
+  - id: dd-disk
+    kind: regex
+    pattern: "(^|\\s)dd\\s+.*of=/dev/(sd|nvme|vd|xvd)[a-z0-9]+"
+    description: Prevent raw disk overwrite.
+    enabled: true
+
+risk:
+  highPatterns:
+    - "systemctl\\s+(stop|disable|restart)"
+    - "service\\s+\\w+\\s+(stop|restart)"
+    - "ufw\\s+"
+    - "iptables"
+    - "apt(-get)?\\s+(remove|purge|upgrade|dist-upgrade)"
+    - "dnf\\s+upgrade"
+    - "yum\\s+update"
+    - "caddy\\s+reload"
+  mediumPatterns:
+    - "git\\s+pull"
+    - "git\\s+clone"
+    - "docker\\s+(build|run|compose)"
+    - "npm\\s+(install|ci)"
+    - "pnpm\\s+install"
+    - "bun\\s+install"
+    - "pip\\s+install"
